@@ -42,7 +42,7 @@ if IS_MAC:
 if IS_WIN:
     import winreg
 
-# ── Platform-aware dependency check ──────────────────────────────────────
+# ── Platform-aware dependency check ───────────────────────────────────
 CRITICAL_MODULES = ["tkinter"]
 REQUIRED_MODULES = ["json", "os", "subprocess", "threading", "re",
                     "importlib", "shutil", "sys"]
@@ -143,7 +143,7 @@ NOVELTY_VOICES = frozenset({
     "Whisper", "Wobble", "Zarvox",
 })
 
-# ── Translation target locales (shared by both platforms) ─────────────────────
+# ── Translation target locales (shared by both platforms) ─────────────
 # Ordered (locale, display) pairs for the target-language dropdown.
 TRANSLATION_LOCALES = [
     ("ar_AE", "Arabic"),
@@ -177,7 +177,7 @@ ARGOS_CODE_TO_DISPLAY = {}
 for _loc, _disp in TRANSLATION_LOCALES:
     ARGOS_CODE_TO_DISPLAY.setdefault(_loc.split("_")[0], _disp)
 
-# ── Google (online) engine ────────────────────────────────────────────────
+# ── Google (online) engine ───────────────────────────────────────────
 # Locale -> Google Translate/TTS language code.
 LOCALE_TO_GOOGLE_CODE = {
     "ar_AE": "ar", "de_DE": "de", "en_GB": "en-GB", "en_US": "en",
@@ -192,6 +192,18 @@ GOOGLE_UA = "Mozilla/5.0"
 GOOGLE_TIMEOUT = 10
 GOOGLE_SPEED_BUCKETS = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 TTS_CHUNK_LIMIT = 200
+
+# Google Translate endpoints, tried in order (translate.googleapis.com is
+# frequently 429-blocked from some networks; the others are alternates).
+# All three return the same JSON shape: data[0] = list of segments
+# (seg[0] = text), data[2] = detected source code.
+GOOGLE_TRANSLATE_ENDPOINTS = [
+    "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={tl}&dt=t&q={q}",
+    "https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl={tl}&q={q}",
+    "https://translate.google.com/translate_a/single?client=dict-chrome-ex&sl=auto&tl={tl}&dt=t&q={q}",
+]
+GOOGLE_TRANSLATE_RETRIES = 2          # retries per endpoint, after the first attempt
+GOOGLE_TRANSLATE_BACKOFF = [1.0, 2.0]  # seconds to sleep between retries
 
 
 def clamp(value, lo, hi):
@@ -214,7 +226,7 @@ def chunk_text_for_tts(text: str, limit: int = TTS_CHUNK_LIMIT):
     """
     if len(text) <= limit:
         return [text]
-    parts = [p for p in re.split(r"(?<=[\u3002\uff01\uff1f.!?])", text) if p]
+    parts = [p for p in re.split(r"(?<=[。！？.!?])", text) if p]
     chunks: list[str] = []
     current = ""
     for part in parts:
@@ -239,20 +251,45 @@ def cache_key(text: str, lang: str, bucket: float) -> str:
 
 
 def google_translate(text: str, target_code: str) -> tuple[str, str]:
-    """Google Translate (client=gtx). Returns (translated, detected_source_code).
+    """Google Translate with endpoint failover + retry/backoff.
 
-    Raises on network/HTTP/timeout errors — caller falls back to Local.
+    Tries GOOGLE_TRANSLATE_ENDPOINTS in order; each endpoint gets
+    GOOGLE_TRANSLATE_RETRIES retries with GOOGLE_TRANSLATE_BACKOFF sleep
+    between attempts. All endpoints return the same shape: data[0] is a list
+    of segments (seg[0] = text, joined), data[2] is the detected source code.
+
+    Returns (translated, detected_source_code). Raises on total failure —
+    caller falls back to Local.
     """
-    url = ("https://translate.googleapis.com/translate_a/single?client=gtx"
-           f"&sl=auto&tl={urllib.parse.quote(target_code, safe='')}"
-           f"&dt=t&q={urllib.parse.quote(text, safe='')}")
-    req = urllib.request.Request(url, headers={"User-Agent": GOOGLE_UA})
-    with urllib.request.urlopen(req, timeout=GOOGLE_TIMEOUT) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    segments = data[0] if data and data[0] else []
-    translated = "".join(seg[0] for seg in segments if seg and seg[0])
-    detected = data[2] if len(data) > 2 and data[2] else ""
-    return translated, detected
+    q = urllib.parse.quote(text, safe='')
+    tl = urllib.parse.quote(target_code, safe='')
+    last_err: Exception | None = None
+    for template in GOOGLE_TRANSLATE_ENDPOINTS:
+        url = template.format(tl=tl, q=q)
+        for attempt in range(GOOGLE_TRANSLATE_RETRIES + 1):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": GOOGLE_UA})
+                with urllib.request.urlopen(req, timeout=GOOGLE_TIMEOUT) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                segments = data[0] if data and data[0] else []
+                if segments and isinstance(segments[0], str):
+                    # Flat shape (clients5.google.com dict-chrome-ex):
+                    # data[0] = [translated_text, detected_source]
+                    translated = segments[0]
+                    detected = segments[1] if len(segments) > 1 else ""
+                else:
+                    # Segment shape (translate_a/single): data[0] = list of
+                    # segments (seg[0] = text), data[2] = detected source.
+                    translated = "".join(seg[0] for seg in segments if seg and seg[0])
+                    detected = data[2] if len(data) > 2 and data[2] else ""
+                return translated, detected
+            except Exception as e:
+                last_err = e
+                if attempt < GOOGLE_TRANSLATE_RETRIES:
+                    time.sleep(GOOGLE_TRANSLATE_BACKOFF[attempt])
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("google translate failed")
 
 
 def google_tts_fetch(text: str, lang: str, bucket: float) -> bytes:
@@ -266,7 +303,7 @@ def google_tts_fetch(text: str, lang: str, bucket: float) -> bytes:
         return resp.read()
 
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────────────
 DEFAULT_CONFIG = {"engine": "local", "cache_max_mb": 100}
 
 
@@ -306,7 +343,7 @@ def save_config(cfg: dict) -> None:
         pass
 
 
-# ── Audio cache (hybrid LRFU, disk-backed) ─────────────────────────────────────
+# ── Audio cache (hybrid LRFU, disk-backed) ───────────────────────────
 class AudioCache:
     """Disk cache for Google TTS MP3s with hybrid LRFU eviction.
 
@@ -484,7 +521,7 @@ class AudioCache:
             self._save_meta_locked({})
             return n
 
-# ── macOS: keyboard layout name -> locale (com.apple.HIToolbox) ─────────────────
+# ── macOS: keyboard layout name -> locale (com.apple.HIToolbox) ───────
 KEYBOARD_LAYOUT_TO_LOCALE = {
     "U.S.": "en_US", "ABC": "en_US",
     "British": "en_GB",
@@ -520,7 +557,7 @@ INPUT_METHOD_TO_LOCALE = {
     "com.apple.inputmethod.SCIM.ITABC": "zh_CN",
 }
 
-# ── Windows: HKCU\Keyboard Layout\Preload LCID -> locale ──────────────────────────
+# ── Windows: HKCU\Keyboard Layout\Preload LCID -> locale ──────────────
 LCID_TO_LOCALE = {
     0x0409: "en_US", 0x0412: "ko_KR", 0x0804: "zh_CN", 0x0404: "zh_TW",
     0x040C: "fr_FR", 0x0407: "de_DE", 0x0410: "it_IT", 0x0411: "ja_JP",
@@ -548,7 +585,7 @@ def parse_lcid_values(values):
     return locales
 
 
-# ── Windows: pyttsx3 voice locale normalization ─────────────────────────────────
+# ── Windows: pyttsx3 voice locale normalization ───────────────────────
 _LOCALE_RE = re.compile(r"([a-zA-Z]{2,3})[-_]([A-Za-z]{2})(?![A-Za-z])")
 _KNOWN_LANGS = frozenset({"en", "fr", "de", "es", "it", "ja", "ko", "zh", "pt",
                           "ru", "ar", "nl", "hi", "id", "th", "tr", "uk", "vi", "pl"})
@@ -583,7 +620,7 @@ def normalize_voice_locale(langs, vid="", name=""):
     return locale_from_id(vid) or locale_from_id(name) or ""
 
 
-# ── Windows: argos-translate core call ────────────────────────────────────────────
+# ── Windows: argos-translate core call ────────────────────────────────
 def argos_translate(text, src_code, tgt_code, langs):
     """Core argos-translate call.
 
@@ -699,7 +736,7 @@ class TranslateGUI:
     def _build_ui(self):
         pad = {"padx": 8, "pady": 4}
 
-        # ── Row 1: engine + voice + speed ──────────────────────────────────────────
+        # ── Row 1: engine + voice + speed ───────────────────────────
         row1 = tk.Frame(self.root)
         row1.pack(fill="x", **pad)
 
@@ -735,7 +772,7 @@ class TranslateGUI:
         self.speed_label.pack(side="left")
         self._on_speed()  # sync label to initial value
 
-        # ── Row 2: text entry + say button ─────────────────────────────────────
+        # ── Row 2: text entry + say button ───────────────────────────
         row2 = tk.Frame(self.root)
         row2.pack(fill="x", **pad)
 
@@ -748,7 +785,7 @@ class TranslateGUI:
         say_btn = ttk.Button(row2, text="Say", command=self._speak)
         say_btn.pack(side="left")
 
-        # ── Row 2b: translate target + status ────────────────────────────────────
+        # ── Row 2b: translate target + status ────────────────────────
         row2b = tk.Frame(self.root)
         row2b.pack(fill="x", **pad)
 
@@ -764,7 +801,7 @@ class TranslateGUI:
         self.status_label = tk.Label(row2b, text="", anchor="w", fg="#555")
         self.status_label.pack(side="left", fill="x", expand=True)
 
-        # ── Row 2c: translation output ────────────────────────────────────────
+        # ── Row 2c: translation output ───────────────────────────────
         row2c = tk.Frame(self.root)
         row2c.pack(fill="x", **pad)
 
@@ -773,7 +810,7 @@ class TranslateGUI:
                                        font=("", 11), relief="solid", borderwidth=1)
         self.translation_box.pack(side="left", fill="x", expand=True, padx=(2, 0))
 
-        # ── Row 2d: cache controls ──────────────────────────────────────────────
+        # ── Row 2d: cache controls ───────────────────────────────────
         row2d = tk.Frame(self.root)
         row2d.pack(fill="x", **pad)
 
@@ -786,7 +823,7 @@ class TranslateGUI:
         ttk.Button(row2d, text="Clear cache",
                    command=self._clear_cache).pack(side="left", padx=(4, 0))
 
-        # ── Row 3: history toggle ──────────────────────────────────────────────────
+        # ── Row 3: history toggle ─────────────────────────────────────
         row3 = tk.Frame(self.root)
         row3.pack(fill="x", padx=8, pady=(0, 2))
 
@@ -794,7 +831,7 @@ class TranslateGUI:
                                      command=self._toggle_history)
         self.toggle_btn.pack(side="left")
 
-        # ── Row 4: collapsible history frame ─────────────────────────────────────
+        # ── Row 4: collapsible history frame ─────────────────────────
         self.hist_frame = tk.Frame(self.root)
         # not packed initially (hidden)
 
@@ -807,7 +844,7 @@ class TranslateGUI:
         self.scrollbar.pack(side="right", fill="y")
         self.listbox.pack(side="left", fill="both", expand=True)
 
-        # ── apply persisted engine mode ──────────────────────────────────────────
+        # ── apply persisted engine mode ──────────────────────────────
         if self.config["engine"] == "google":
             self.engine_var.set("Google (online)")
         self._apply_engine_mode()
@@ -995,6 +1032,11 @@ class TranslateGUI:
                              args=(text, locale, speed, gen, ggen), daemon=True)
         t.start()
 
+    @staticmethod
+    def _google_code(locale: str) -> str:
+        """Locale ('ko_KR') or bare code ('ko') -> Google language code."""
+        return LOCALE_TO_GOOGLE_CODE.get(locale, locale.split("_")[0])
+
     def _google_tts_lang(self) -> str:
         """TTS language for untranslated speech: from the selected voice's locale."""
         display = self.voice_var.get()
@@ -1009,7 +1051,7 @@ class TranslateGUI:
         return "en"
 
     def _run_google_translate(self, text, locale, speed, gen, ggen):
-        tgt_code = LOCALE_TO_GOOGLE_CODE.get(locale, locale.split("_")[0])
+        tgt_code = self._google_code(locale)
         try:
             translated, detected = google_translate(text, tgt_code)
         except Exception as e:
@@ -1039,36 +1081,38 @@ class TranslateGUI:
         self._google_speak_text(translated, tgt_code, speed, ggen)
 
     def _google_fallback(self, msg, text, locale, speed, gen, ggen):
-        """Google translate failed → run the existing Local translate+speak path."""
+        """Google translate blocked → run the existing Local translate path, but
+        keep Google TTS for speech (the translate endpoint is blocked while the
+        TTS endpoint still works)."""
         if gen != self._translate_gen or ggen != self._google_gen:
             return
-        self.status_label.config(text=msg)
+        self.status_label.config(text="Google translate blocked (429), using Local translation…")
         display = self.voice_var.get()
         raw_id = next((r for d, r in self.voices if d == display), display)
         if IS_MAC and not self._ensure_helper():
             self.status_label.config(text="compiling translation support…")
-            self._speak_text(text, raw_id, display, speed)
+            self._google_speak_text(text, self._google_tts_lang(), speed, ggen, blocked=True)
             return
         t = threading.Thread(target=self._run_translate,
-                             args=(text, locale, raw_id, display, speed, gen),
+                             args=(text, locale, raw_id, display, speed, gen, ggen, True),
                              daemon=True)
         t.start()
 
-    def _google_speak_text(self, text, lang, speed, ggen):
+    def _google_speak_text(self, text, lang, speed, ggen, blocked=False):
         if ggen != self._google_gen:
             return
         t = threading.Thread(target=self._run_google_tts,
-                             args=(text, lang, speed, ggen), daemon=True)
+                             args=(text, lang, speed, ggen, blocked), daemon=True)
         t.start()
 
-    def _run_google_tts(self, text, lang, speed, ggen):
+    def _run_google_tts(self, text, lang, speed, ggen, blocked=False):
         bucket = speed_to_bucket(speed)
         chunks = chunk_text_for_tts(text)
         if chunks is None:
             if ggen != self._google_gen:
                 return
             self.root.after(0, lambda: self._google_tts_fallback(
-                text, lang, speed, ggen, "text too long to chunk"))
+                text, lang, speed, ggen, "text too long to chunk", blocked))
             return
         for chunk in chunks:
             if ggen != self._google_gen:
@@ -1078,7 +1122,7 @@ class TranslateGUI:
                 if ggen != self._google_gen:
                     return
                 self.root.after(0, lambda: self._google_tts_fallback(
-                    text, lang, speed, ggen, err))
+                    text, lang, speed, ggen, err, blocked))
                 return
             if ggen != self._google_gen:
                 self._cleanup_audio(path)
@@ -1086,11 +1130,17 @@ class TranslateGUI:
             self._play_mp3(path, ggen)
             self._cleanup_audio(path)
 
-    def _google_tts_fallback(self, text, lang, speed, ggen, err=None):
+    def _google_tts_fallback(self, text, lang, speed, ggen, err=None, blocked=False):
         if ggen != self._google_gen:
             return
         note = f" ({err})" if err else ""
-        self.status_label.config(text=f"Google TTS failed{note}, trying Local…")
+        if blocked:
+            # Google translate was already blocked — keep that note in the
+            # final status so the user knows why Local speech was used.
+            self.status_label.config(
+                text=f"Google TTS failed{note} — Google translate blocked, using Local speech")
+        else:
+            self.status_label.config(text=f"Google TTS failed{note}, trying Local…")
         display = self.voice_var.get()
         raw_id = next((r for d, r in self.voices if d == display), display)
         self._speak_text(text, raw_id, display, speed)
@@ -1107,14 +1157,17 @@ class TranslateGUI:
                 return
             try:
                 playsound.playsound(path)
-            except Exception:
-                pass
+            except Exception as e:
+                self.root.after(0, lambda: self.status_label.config(
+                    text=f"Audio player failed (playsound: {e})"))
             return
         mpv = shutil.which("mpv")
         cmd = [mpv, "--no-video", "--really-quiet", path] if mpv else ["afplay", path]
         try:
             proc = subprocess.Popen(cmd)
-        except Exception:
+        except Exception as e:
+            self.root.after(0, lambda: self.status_label.config(
+                text=f"Audio player failed (mpv/afplay missing?) — {e}"))
             return
         self._playback_proc = proc
         try:
@@ -1158,7 +1211,8 @@ class TranslateGUI:
         self.root.after(0, lambda: self.status_label.config(
             text="translation support ready" if ok else "translation compile failed"))
 
-    def _run_translate(self, text, locale, raw_id, display, speed, gen):
+    def _run_translate(self, text, locale, raw_id, display, speed, gen,
+                       ggen=None, google_tts=False):
         if IS_MAC:
             result = self._translate_mac(text, locale)
         else:
@@ -1166,7 +1220,7 @@ class TranslateGUI:
         if gen != self._translate_gen:
             return  # superseded by a newer translate — skip UI updates
         self.root.after(0, lambda: self._handle_translate_result(
-            result, locale, text, raw_id, display, speed))
+            result, locale, text, raw_id, display, speed, ggen, google_tts))
 
     def _translate_mac(self, text, locale):
         """Call the Swift helper. Returns a result tuple, or None if superseded."""
@@ -1252,34 +1306,61 @@ class TranslateGUI:
         # en_US/en_GB → en, zh_CN/zh_TW → zh (argos zh = Simplified).
         return locale.split("_")[0]
 
-    def _handle_translate_result(self, result, locale, text, raw_id, display, speed):
+    def _handle_translate_result(self, result, locale, text, raw_id, display, speed,
+                                 ggen=None, google_tts=False):
         if result is None:
             return  # superseded
         kind = result[0]
         if kind == "ok":
             _, translated, src, tgt = result
-            self._translation_success(translated, src, tgt, locale, raw_id, display, speed)
+            self._translation_success(translated, src, tgt, locale, raw_id, display,
+                                      speed, ggen, google_tts)
         elif kind == "noop":
             _, tgt = result
-            self._translation_noop(text, raw_id, display, speed, tgt)
+            self._translation_noop(text, raw_id, display, speed, tgt, ggen, google_tts)
         else:
             _, msg = result
-            self._translation_failed(msg, text, raw_id, display, speed)
+            self._translation_failed(msg, text, raw_id, display, speed, ggen, google_tts)
 
-    def _translation_success(self, translated, src, tgt, locale, raw_id, display, speed):
+    def _translation_success(self, translated, src, tgt, locale, raw_id, display,
+                             speed, ggen=None, google_tts=False):
         self._set_translation_box(translated)
         note = " (Traditional → Simplified)" if locale == "zh_TW" else ""
+        if google_tts:
+            # Google translate blocked → Local translated, but keep Google TTS
+            # (the TTS endpoint still works). Final status keeps the note.
+            self.status_label.config(
+                text=f"Translated from {src} to {tgt}{note} "
+                     "(Google translate blocked — Local used, Google TTS)")
+            self._google_speak_text(translated, self._google_code(tgt), speed, ggen,
+                                    blocked=True)
+            return
         self.status_label.config(text=f"Translated from {src} to {tgt}{note}")
         self._speak_text(translated, raw_id, display, speed)
 
-    def _translation_noop(self, text, raw_id, display, speed, tgt):
+    def _translation_noop(self, text, raw_id, display, speed, tgt,
+                          ggen=None, google_tts=False):
         self._clear_translation_box()
         lang = ARGOS_CODE_TO_DISPLAY.get(tgt, tgt)
+        if google_tts:
+            self.status_label.config(
+                text=f"already {lang} (Google translate blocked — Local used, Google TTS)")
+            self._google_speak_text(text, self._google_code(tgt), speed, ggen,
+                                    blocked=True)
+            return
         self.status_label.config(text=f"already {lang}")
         self._speak_text(text, raw_id, display, speed)
 
-    def _translation_failed(self, msg, text, raw_id, display, speed):
+    def _translation_failed(self, msg, text, raw_id, display, speed,
+                            ggen=None, google_tts=False):
         self._clear_translation_box()
+        if google_tts:
+            self.status_label.config(
+                text="Google translate blocked, Local translate failed — "
+                     "speaking original via Google TTS")
+            self._google_speak_text(text, self._google_tts_lang(), speed, ggen,
+                                    blocked=True)
+            return
         self.status_label.config(text=msg)
         self._speak_text(text, raw_id, display, speed)
 
