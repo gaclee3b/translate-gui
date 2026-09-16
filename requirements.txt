@@ -1,0 +1,6 @@
+# Windows only:
+# macOS requires no pip dependencies beyond Python 3 + tkinter.
+
+pyttsx3
+argos-translate
+playsound
