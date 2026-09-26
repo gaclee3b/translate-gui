@@ -226,7 +226,17 @@ const TRANSLATION_LOCALES = [
    the single most common target (the pasted text is usually already in it),
    and the same-language no-op then reads the text back aloud in that
    language. A copy is taken so the two lists can never alias. */
-const TARGET_LOCALES = TRANSLATION_LOCALES.slice();
+/* The copy is sorted by DISPLAY NAME, not by locale code. In code order the
+   dropdown read as noise to a user (German before English, Spanish before
+   French, Dutch after Korean, both Chineses at the very end). TRANSLATION_LOCALES
+   above keeps its original order as the canonical list — only the target copy
+   is reordered, so nothing else in the page shifts. Case-insensitive compare
+   on element [1]; Array#sort is stable, so the two English variants keep
+   their UK-before-US relative order and defaultTargetFor('en-...') still
+   resolves identically. */
+const TARGET_LOCALES = TRANSLATION_LOCALES.slice().sort(function (a, b) {
+  return String(a[1]).toLowerCase().localeCompare(String(b[1]).toLowerCase());
+});
 /* Locale -> Google Translate / TTS language code (ported). */
 const LOCALE_TO_GOOGLE_CODE = {
   ar_AE: 'ar', de_DE: 'de', en_GB: 'en-GB', en_US: 'en', es_ES: 'es', fr_FR: 'fr',
@@ -631,6 +641,16 @@ function defaultAudioBackend() {
     play: function (url, gen) {
       return new Promise(function (resolve, reject) {
         const audio = new Audio();
+        /* Google's TTS endpoint answers 404 text/html to any request that
+           carries a Referer header, and serves audio/mpeg only when none is
+           sent. A media element ALWAYS sends Referer for a cross-origin src,
+           so the audio 404'd, onerror fired, and the page fell back to the
+           computer voice. no-referrer omits the header entirely. The element
+           must carry the policy BEFORE src is assigned, or the request that
+           src kicks off still goes out with a Referer. The attribute is set
+           too, for engines that only honour the content attribute. */
+        audio.referrerPolicy = 'no-referrer';
+        audio.setAttribute('referrerpolicy', 'no-referrer');
         let done = false, started = false, startTimer = null;
         function finish(how, err) {
           if (done) return;
@@ -846,7 +866,17 @@ function loadSettings() {
   const s = lsGet(SETTINGS_KEY);
   const out = defaultSettings();
   if (s && typeof s === 'object') {
-    if (s.engine === 'google' || s.engine === 'browser') out.engine = s.engine;
+    /* MIGRATION from the old build. That build defaulted the engine to
+       'browser' and saveSettings() persisted it, so a returning user arrives
+       with engine:'browser' already in tweb.settings.v1 — currentEngine()
+       then reports 'browser' and the page goes straight to the computer voice
+       without ever trying Google. The app now targets Google audio, so a
+       stored 'browser' is treated as the stale default it is and the new
+       default applies. Only the engine is discarded: the rest of the record
+       (target, speed, voice) is still honoured, and nothing is deleted — the
+       cache and the history are untouched. Any other stored engine, including
+       'google', is kept. */
+    if (s.engine === 'google') out.engine = 'google';
     if (typeof s.voice === 'string') out.voice = s.voice;
     if (typeof s.speed === 'number' && s.speed >= SPEED_MIN && s.speed <= SPEED_MAX) out.speed = Math.round(s.speed);
     /* A SAVED target always beats the derived default. */
@@ -1274,6 +1304,7 @@ if (typeof module !== 'undefined' && module && module.exports) {
     joinSeparator: joinSeparator,
     parseGoogleTranslate: parseGoogleTranslate,
     fetchJson: fetchJson,
+    defaultAudioBackend: defaultAudioBackend,
     speakGoogle: speakGoogle,
     speakBrowser: speakBrowser,
     listBrowserVoices: listBrowserVoices,
