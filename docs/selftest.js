@@ -112,11 +112,44 @@ eq('TTS_CHUNK_LIMIT', T.TTS_CHUNK_LIMIT, 200);
 eq('the target list is every locale, 21 entries', T.TARGET_LOCALES.length, 21);
 ok('en_US is a selectable target', T.TARGET_LOCALES.some(function (p) { return p[0] === 'en_US'; }));
 ok('en_GB is a selectable target', T.TARGET_LOCALES.some(function (p) { return p[0] === 'en_GB'; }));
+/* The invariant is "the same 21 codes, none added or lost", so it is compared
+   as a SET. It was previously a positional compare, which silently encoded
+   "TARGET_LOCALES is an unsorted copy" — precisely what the v10 sort below
+   removes. Set equality keeps the full intent; the exact new ORDER is pinned
+   separately and more strongly by 'sorted target display names' below. */
 eq('the target codes are exactly the TRANSLATION_LOCALES codes',
-  T.TARGET_LOCALES.map(function (p) { return p[0]; }),
-  T.TRANSLATION_LOCALES.map(function (p) { return p[0]; }));
-eq('21 targets, first and last',
-  [T.TARGET_LOCALES[0][0], T.TARGET_LOCALES[20][0]], ['ar_AE', 'zh_TW']);
+  T.TARGET_LOCALES.map(function (p) { return p[0]; }).slice().sort(),
+  T.TRANSLATION_LOCALES.map(function (p) { return p[0]; }).slice().sort());
+/* SPEC CHANGE (v10, dropdown order). The target list is now sorted ALPHABETICALLY
+   BY DISPLAY NAME — the label the user actually reads — instead of by locale
+   code, because code order reads as random in the dropdown. So the first/last
+   pair changes: first is still Arabic (ar_AE, sorts first either way) but the
+   LAST entry is now Vietnamese vi_VN, not zh_TW. The codes-as-a-set assertion
+   above is unaffected and still proves no locale was added or lost. */
+eq('21 targets, first and last (sorted by display name)',
+  [T.TARGET_LOCALES[0][0], T.TARGET_LOCALES[20][0]], ['ar_AE', 'vi_VN']);
+/* The real guard: the display names must be in non-decreasing case-insensitive
+   alphabetical order. This FAILS if the sort in index.html is removed, since
+   code order puts German ('german') before English ('english (uk)'). */
+{
+  const names = T.TARGET_LOCALES.map(function (p) { return String(p[1]).toLowerCase(); });
+  const outOfOrder = [];
+  for (let i = 1; i < names.length; i += 1) {
+    if (names[i - 1].localeCompare(names[i]) > 0) outOfOrder.push(i - 1 + ':' + names[i - 1] + ' > ' + i + ':' + names[i]);
+  }
+  ok('target display names are in non-decreasing alphabetical order', outOfOrder.length === 0, outOfOrder.join('; '));
+  eq('sorted target display names',
+    names, ['arabic', 'chinese (simplified)', 'chinese (traditional)', 'dutch', 'english (uk)', 'english (us)',
+      'french', 'german', 'hindi', 'indonesian', 'italian', 'japanese', 'korean', 'polish', 'portuguese',
+      'russian', 'spanish', 'thai', 'turkish', 'ukrainian', 'vietnamese']);
+  /* The canonical list must NOT have been reordered along with the copy. */
+  eq('TRANSLATION_LOCALES keeps its original locale-code order',
+    T.TRANSLATION_LOCALES.map(function (p) { return p[0]; }).slice(0, 4),
+    ['ar_AE', 'de_DE', 'en_GB', 'en_US']);
+  eq('TRANSLATION_LOCALES still ends with the two Chinese locales',
+    T.TRANSLATION_LOCALES.map(function (p) { return p[0]; }).slice(18),
+    ['vi_VN', 'zh_CN', 'zh_TW']);
+}
 eq('English display names survived the un-exclusion',
   T.TARGET_LOCALES.filter(function (p) { return p[0].indexOf('en_') === 0; }).map(function (p) { return p[1]; }),
   ['English (UK)', 'English (US)']);
@@ -316,6 +349,50 @@ sandbox.localStorage = lsStub;
 eq('a saved target beats the derived default in loadSettings()', T.loadSettings().target, savedTarget);
 delete sandbox.localStorage;
 eq('with the storage stub removed, the derived default is back', T.loadSettings().target, T.DEFAULT_TARGET);
+
+/* G. The stale-engine migration. The old build defaulted the engine to
+    'browser' and PERSISTED it, so a returning user's tweb.settings.v1 says
+    engine:'browser' and the page never even tries Google audio. The migration
+    must drop that one field and keep the rest of the record. */
+function settingsStub(record) {
+  const calls = { removeItem: [], setItem: [] };
+  return {
+    calls: calls,
+    getItem: function (k) { return k === 'tweb.settings.v1' ? JSON.stringify(record) : null; },
+    setItem: function (k, v) { calls.setItem.push(k); return undefined; },
+    removeItem: function (k) { calls.removeItem.push(k); return undefined; }
+  };
+}
+const oldSpeed = (T.SPEED_MIN + T.SPEED_MAX) / 2;             /* inside the clamp range */
+const oldVoice = 'urn:fixture:2';
+
+const stale = settingsStub({ engine: 'browser', target: savedTarget, speed: oldSpeed, voice: oldVoice });
+sandbox.localStorage = stale;
+const migrated = T.loadSettings();
+eq("a persisted engine:'browser' from the old build is migrated to 'google'",
+  migrated.engine, 'google');
+eq('the migration preserves the saved target', migrated.target, savedTarget);
+eq('the migration preserves the saved speed', migrated.speed, oldSpeed);
+eq('the migration preserves the saved voice', migrated.voice, oldVoice);
+eq('the migration deleted nothing from storage', stale.calls.removeItem, []);
+eq('the migration did not rewrite storage behind the user\'s back', stale.calls.setItem, []);
+
+const current = settingsStub({ engine: 'google', target: savedTarget, speed: oldSpeed, voice: oldVoice });
+sandbox.localStorage = current;
+const kept = T.loadSettings();
+eq("a persisted engine:'google' is left alone", kept.engine, 'google');
+eq('and its other settings survive too', [kept.target, kept.speed, kept.voice],
+  [savedTarget, oldSpeed, oldVoice]);
+
+const junk = settingsStub({ engine: 'BROWSER', target: savedTarget, speed: oldSpeed, voice: oldVoice });
+sandbox.localStorage = junk;
+eq('an unrecognised stored engine falls back to the default, other settings intact',
+  [T.loadSettings().engine, T.loadSettings().target, T.loadSettings().speed],
+  ['google', savedTarget, oldSpeed]);
+
+delete sandbox.localStorage;
+eq('with no storage at all the default engine is google', T.loadSettings().engine, 'google');
+eq('defaultSettings().engine is still google with no storage', T.defaultSettings().engine, 'google');
 
 section('strict parser: what must be rejected');
 throws('parseGoogleTranslate(null) throws', function () { T.parseGoogleTranslate(null); });
@@ -594,6 +671,65 @@ process.on('exit', function (code) {
 
   delete sandbox.speechSynthesis;
   delete sandbox.SpeechSynthesisUtterance;
+
+  section('the media element must NOT send a Referer to the TTS endpoint');
+
+  /* The real bug: Google serves a 404 text/html page to a translate_tts
+     request that carries a Referer, and audio/mpeg only when it carries none.
+     A media element always sends one cross-origin, so the audio never loaded
+     and the user heard the computer voice instead. The element must therefore
+     be told to omit the header, BEFORE src is assigned. This drives the real
+     defaultAudioBackend() — not the injectable stub — so a revert of the fix
+     in the play path fails here. */
+  ok('defaultAudioBackend is exported', typeof T.defaultAudioBackend === 'function');
+
+  const created = [];
+  function FakeAudio() {
+    this.referrerPolicy = '';
+    this.attrs = {};
+    this.onplaying = null; this.onended = null; this.onerror = null;
+    this.paused = false;
+    /* Snapshotted by the src setter below: what the policy was AT THE MOMENT
+       the request was kicked off. A policy assigned after src is too late. */
+    this.referrerPolicyAtSrc = null;
+    created.push(this);
+  }
+  Object.defineProperty(FakeAudio.prototype, 'src', {
+    get: function () { return this._src; },
+    set: function (v) { this._src = v; this.referrerPolicyAtSrc = this.referrerPolicy; }
+  });
+  FakeAudio.prototype.setAttribute = function (k, v) { this.attrs[k] = String(v); };
+  FakeAudio.prototype.getAttribute = function (k) {
+    return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] : null;
+  };
+  FakeAudio.prototype.pause = function () { this.paused = true; };
+  /* Fires onplaying then onended, so the promise settles as a real successful
+     playback would — the stubPlatform pattern, applied to audio. */
+  FakeAudio.prototype.play = function () {
+    const self = this;
+    return Promise.resolve().then(function () {
+      if (self.onplaying) self.onplaying();
+      if (self.onended) self.onended();
+    });
+  };
+  sandbox.Audio = FakeAudio;
+
+  const audioUrl = 'https://translate.google.com/translate_tts?ie=UTF-8&q=hola';
+  const playOutcome = await T.defaultAudioBackend().play(audioUrl, T.getOpGen());
+
+  eq('play() created exactly one media element', created.length, 1);
+  eq('the media element is told to omit the Referer header',
+    created[0].referrerPolicy, 'no-referrer');
+  eq('the no-referrer policy is also set as an attribute',
+    created[0].getAttribute('referrerpolicy'), 'no-referrer');
+  eq('the policy was in place BEFORE src was assigned, so the request omits it',
+    created[0].referrerPolicyAtSrc, 'no-referrer');
+  eq('src really was the URL under test', created[0].src, audioUrl);
+  eq('the fake playback reports success', playOutcome, { ok: true });
+
+  delete sandbox.Audio;
+  report('referrerPolicy on the element', created[0].referrerPolicy);
+  report('referrerPolicy when src was assigned', created[0].referrerPolicyAtSrc);
 
   finish();
 })().catch(function (err) {
