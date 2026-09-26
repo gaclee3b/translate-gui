@@ -2,6 +2,11 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<!-- Document-level referrer policy. The Google TTS endpoint 404s (text/html)
+     when the request carries a Referer, and a per-element referrerpolicy on the
+     <audio> is not honoured everywhere, so the document policy is the reliable
+     control: it covers every subresource request, including the media fetch. -->
+<meta name="referrer" content="no-referrer">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Text &rarr; Translated Audio</title>
@@ -388,22 +393,64 @@ function chunkForTranslate(text) {
   return chunks;
 }
 
-/* Chunking for TTS — an exact port of the desktop chunk_text_for_tts, with a
-   deliberately DIFFERENT contract: a single sentence over the limit returns
-   null, which means "fall back to the browser voice". Google TTS cannot be
-   split safely in that case. Length is measured in UTF-16 units, which counts
-   an astral code point as 2 and is therefore never more permissive than the
-   desktop's code-point count. */
+/* Hard-split ONE sentence that is over the TTS limit, the same way
+   chunkForTranslate hard-splits an over-budget sentence. `cps` is a
+   code-point array and [start, end) is an index range into it, so no piece can
+   ever cut a surrogate pair or an astral code point in half.
+
+   Every emitted piece is at most TTS_CHUNK_LIMIT code points, is never empty,
+   and the loop always advances: a piece either ends at the last whitespace in
+   the window (that whitespace is KEPT, so the next piece starts on a word) or
+   at the window end, which is at least one code point further on. Scripts with
+   no spaces at all (Chinese, Japanese, Thai) contain no whitespace in the
+   window, so they take the hard cut — which is correct for them, because there
+   is no word to break on. */
+function hardSplitSentence(cps, start, end) {
+  const pieces = [];
+  let i = start;
+  while (i < end) {
+    const windowEnd = Math.min(i + TTS_CHUNK_LIMIT, end);
+    let cut = -1;
+    for (let k = windowEnd - 1; k > i; k--) {
+      if (/\s/.test(cps[k])) { cut = k + 1; break; }
+    }
+    if (cut < 0) cut = windowEnd;
+    pieces.push(cps.slice(i, cut).join(''));
+    i = cut;
+  }
+  return pieces;
+}
+
+/* Chunking for TTS. The only difference from the desktop contract is the
+   over-limit path: instead of returning null, which made the caller fall back
+   to the browser voice — a voice that usually does not exist for the target
+   language, so the user saw the translation and heard nothing — an oversized
+   sentence is HARD-SPLIT and still sent to Google TTS. This bites hardest in
+   Korean, where a whole paragraph often arrives as one 'sentence' because it
+   has no sentence-final punctuation at all, while English prose usually has
+   periods and so escaped the bug.
+
+   Length is counted in CODE POINTS, not UTF-16 units, so the 200 limit means
+   200 real characters in every language and an astral character counts once.
+   When no sentence exceeds the limit this walks exactly the same sentences and
+   performs exactly the same accumulation as before. */
 function chunkForTts(text) {
-  const t = sanitizeText(text);
-  if (t.length <= TTS_CHUNK_LIMIT) return [t];
-  const parts = splitOnSentences(t);
+  const cps = Array.from(sanitizeText(text));
+  if (cps.length <= TTS_CHUNK_LIMIT) return [cps.join('')];
+  const parts = splitOnSentences(cps.join(''));
   const chunks = [];
   let current = '';
+  let run = 0;
   for (const part of parts) {
-    if (part.length > TTS_CHUNK_LIMIT) return null;
-    if (current.length + part.length <= TTS_CHUNK_LIMIT) { current += part; }
-    else { if (current) chunks.push(current); current = part; }
+    const pcps = Array.from(part);
+    const plen = pcps.length;
+    if (plen > TTS_CHUNK_LIMIT) {          /* the sentence cannot fit: hard split */
+      if (run > 0) { chunks.push(current); current = ''; run = 0; }
+      for (const piece of hardSplitSentence(pcps, 0, plen)) chunks.push(piece);
+      continue;
+    }
+    if (run + plen <= TTS_CHUNK_LIMIT) { current += part; run += plen; }
+    else { if (current) chunks.push(current); current = part; run = plen; }
   }
   if (current) chunks.push(current);
   return chunks;
@@ -951,24 +998,44 @@ function renderVoices() {
   if (chosen) select.value = chosen;
 }
 
-/* Which voiceURI the #voice select should end up on. Pure with respect to the
-   DOM: it reads the platform voice list only, so it is assertable offline.
-   The saved voice wins when the platform still offers it; a voice that has
-   disappeared (a removed voice pack, a different OS) falls back to the first
-   voice actually available, because leaving the select on selectedIndex -1
-   would read as "nothing selected" and speak with an arbitrary voice. */
-function preferredVoice(settings) {
+/* Which voiceURI the #voice select should end up on, and which voice a speech
+   path is allowed to use. Pure with respect to the DOM: it reads the platform
+   voice list only, so it is assertable offline.
+
+   With NO target language this is the select's own restore: a saved voice wins
+   when the platform still offers it, and a voice that has disappeared (a
+   removed voice pack, a different OS) falls back to the first voice actually
+   available, because leaving the select on selectedIndex -1 would read as
+   "nothing selected".
+
+   WITH a target language the voice precedence is applied in order:
+     1. an EXPLICITLY SAVED voice that is still installed is the user's own
+        choice and is honoured even when its language differs from the target;
+     2. otherwise an installed voice whose language matches the target;
+     3. otherwise '' — which the caller must read as DO NOT SPEAK. Reading a
+        target-language text aloud with a wrong-language voice is the defect
+        this rule exists to prevent, so silence is strictly better than gibberish.
+   "Saved" means the stored record, NOT the select's current value: the select
+   is auto-populated with the first installed voice, so reading it back would
+   make rule 1 fire for a voice the user never chose. */
+function preferredVoice(settings, targetLang) {
   const wanted = (settings && typeof settings.voice === 'string') ? settings.voice : '';
   const voices = listBrowserVoices();
+  const uriOf = function (v) { return (v && (v.voiceURI || v.name)) ? (v.voiceURI || v.name) : ''; };
   if (wanted) {
     for (const v of voices) {
-      const uri = (v && (v.voiceURI || v.name)) ? (v.voiceURI || v.name) : '';
-      if (uri === wanted) return wanted;
+      if (uriOf(v) === wanted) return wanted;
     }
   }
+  const target = (targetLang === null || targetLang === undefined) ? '' : baseCode(targetLang);
+  if (target) {
+    for (const v of voices) {
+      if (v && v.lang && baseCode(v.lang) === target) return uriOf(v);
+    }
+    return '';
+  }
   if (voices.length > 0) {
-    const first = voices[0];
-    return (first && (first.voiceURI || first.name)) ? (first.voiceURI || first.name) : '';
+    return uriOf(voices[0]);
   }
   return '';
 }
@@ -1109,6 +1176,27 @@ async function onTranslate() {
    generation of the user action that triggered it, and its only caller is
    onTranslate. */
 
+/* Is there anything here a speech engine could actually pronounce? "." passes a
+   non-empty check and the local engine audibly says "dot" for it, which both
+   misleads the user and hides the real failure. A remainder is only worth
+   handing to speakBrowser if it carries at least one letter or digit. The test
+   is Unicode-aware so Hangul/CJK counts as speech.
+
+   The pattern is built with the RegExp CONSTRUCTOR, not a regex literal, and
+   that is the whole point: a literal carrying a Unicode property escape is
+   rejected at PARSE time, so an engine without property-escape support never
+   reaches the catch and the entire script fails to load. Constructed at run
+   time the same engine throws a catchable SyntaxError here and degrades to the
+   conservative ASCII test, which is deliberately narrower — see the product
+   risk accepted for non-Latin targets on such an engine. */
+let SPEAKABLE_RE;
+try { SPEAKABLE_RE = new RegExp('[\\p{L}\\p{N}]', 'u'); } catch (e) { SPEAKABLE_RE = /[A-Za-z0-9]/; }
+
+function hasSpeakableContent(s) {
+  const str = (s === null || s === undefined) ? '' : String(s);
+  return SPEAKABLE_RE.test(str);
+}
+
 /* The ONE place a speakBrowser() result becomes a status line, so no speech
    path can report that it spoke when it did not. speakBrowser resolves
    exactly one of: {stale:true} (a newer action took over — say nothing),
@@ -1150,24 +1238,41 @@ async function runSpeech(gen, selection) {
       setStatus('The Google voice failed (' + describeError(outcome.error) + '). Using the browser voice.', 'err');
     }
     const remainder = (outcome.remainder !== undefined) ? outcome.remainder : text;
-    if (!remainder || !remainder.trim()) { setStatus('Google playback failed and there was nothing left to speak.', 'err'); return; }
-    const voiceSelect = el('voice');
+    if (!hasSpeakableContent(remainder)) { setStatus('The Google voice failed and there was nothing speakable left to read.', 'err'); return; }
+    /* Same precedence as the browser-primary path below, so a partial Google
+       playback can never end in a wrong-language voice either. */
+    const remainderVoice = preferredVoice(loadSettings(), lang);
+    if (!remainderVoice) { setStatus('The Google voice failed and no installed voice matches ' + lang + '.', 'err'); return; }
     const res = await speakBrowser(remainder, {
       gen: gen,
-      lang: (voiceSelect && voiceSelect.value) ? undefined : baseCode(lang),
+      /* A resolved INSTALLED voice is authoritative for the language, so
+         utter.lang is left unset exactly as it was when the select carried a
+         voice. Overriding it would fight the very rule that chose the voice. */
+      lang: undefined,
       rate: wpmToRate(wpm),
-      voiceURI: voiceSelect ? voiceSelect.value : ''
+      voiceURI: remainderVoice
     });
     if (res === STALE || (res && res.stale) || !isCurrent(gen)) return;
     reportBrowserSpeech('Spoke the remainder with the browser voice.', res);
     return;
   }
-  const voiceSelect = el('voice');
+  /* Browser-primary path: "Browser local" (or a Google engine with no local
+     voice support). The guard below is the same one the Google-failure path
+     uses, applied here too: "." passes a non-empty check and the local engine
+     audibly says "dot", which misleads the user and hides what happened. A
+     letter/digit-bearing input is unaffected. */
+  if (!hasSpeakableContent(text)) { setStatus('Nothing in the translation was speakable, so no audio was played.', 'err'); return; }
+  /* The precedence: a saved installed voice first, then an installed voice that
+     matches the target, otherwise nothing is spoken at all. See
+     preferredVoice(settings, targetLang). */
+  const chosenVoice = preferredVoice(loadSettings(), lang);
+  if (!chosenVoice) { setStatus('No installed voice matches ' + lang + ', so no audio was played.', 'err'); return; }
   const res = await speakBrowser(text, {
     gen: gen,
-    lang: baseCode(lang),
+    /* The chosen voice's own language wins, for the same reason as above. */
+    lang: undefined,
     rate: wpmToRate(wpm),
-    voiceURI: voiceSelect ? voiceSelect.value : ''
+    voiceURI: chosenVoice
   });
   if (res === STALE || (res && res.stale) || !isCurrent(gen)) return;
   reportBrowserSpeech('Spoke with the browser voice.', res);
@@ -1293,11 +1398,13 @@ if (typeof module !== 'undefined' && module && module.exports) {
     PROVIDERS: PROVIDERS,
     clamp: clamp,
     sanitizeText: sanitizeText,
+    hasSpeakableContent: hasSpeakableContent,
     encodedLen: encodedLen,
     speedToBucket: speedToBucket,
     wpmToRate: wpmToRate,
     splitOnSentences: splitOnSentences,
     largestFittingPiece: largestFittingPiece,
+    hardSplitSentence: hardSplitSentence,
     chunkForTranslate: chunkForTranslate,
     chunkForTts: chunkForTts,
     joinTranslated: joinTranslated,
