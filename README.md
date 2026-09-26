@@ -111,3 +111,62 @@ This project was generated with AI assistance. Code reviewed by human.
 ## License
 
 MIT — see [LICENSE](LICENSE)
+
+---
+
+## Web version (browser)
+
+A browser version of the same idea lives in [`docs/index.html`](docs/index.html) and is served by
+GitHub Pages:
+
+**<https://gaclee3b.github.io/translate-gui/>**
+
+It is a single self-contained HTML file — no build step, no server, no dependencies, no CDN. Open it
+and it works.
+
+### What it does differently
+
+| | Desktop app | Web version |
+|---|---|---|
+| Translation | Offline **or** Google | **Google only** |
+| Speech | `say` / pyttsx3 (offline) | Browser `speechSynthesis` (offline) **or** Google TTS |
+| Audio cache | LRFU on disk | Translation cache in `localStorage` (audio cannot be cached cross-origin) |
+| Targets | Filtered to your keyboard layouts | All 19 target languages |
+| Install | Python + tkinter | None |
+
+The offline engines are gone by design. Apple's Translation framework, `say` and argos-translate are
+local programs and cannot run in a browser. That is the trade for needing no server, no model
+download and no maintenance. **Use the desktop app when you need offline translation.**
+
+### Enabling Pages (one-time, manual)
+
+1. Repo → **Settings** → **Pages**
+2. **Source:** Deploy from a branch
+3. **Branch:** `main` · **Folder:** `/docs`
+4. Save — the site is live in about a minute
+
+### Running the tests
+
+[`docs/selftest.js`](docs/selftest.js) is an offline fixture harness — 122 assertions, no network,
+no browser:
+
+```bash
+curl -sO https://raw.githubusercontent.com/gaclee3b/translate-gui/main/docs/index.html
+curl -sO https://raw.githubusercontent.com/gaclee3b/translate-gui/main/docs/selftest.js
+node selftest.js     # PASS  122 checks, 0 failures
+```
+
+It covers the parts that are easy to get quietly wrong: the 8000-character **encoded** request
+budget (CJK percent-encodes 9×, so a plain character cap fails), code-point-safe splitting, strict
+response parsing, the timeout-versus-cancellation distinction, and the rule that a partial Google-TTS
+failure replays only the unplayed remainder.
+
+### Notes and honest limitations
+
+- Text is sent to **Google** for both translation and speech. There is no server in between, so there
+  is nothing here that logs it beyond what Google itself does.
+- Google's free endpoints are unofficial and rate-limit by IP. The page fails over between endpoints
+  automatically. `translate.google.com/translate_a/single?client=dict-chrome-ex` is **not** used as a
+  browser fallback because it sends no `Access-Control-Allow-Origin` header, so a page cannot fetch it.
+- The page has been verified by its offline test suite and static analysis. It has not been verified
+  in a real browser in CI, so audio autoplay policy and voice-list loading are worth a manual check.
