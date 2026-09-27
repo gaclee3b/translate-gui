@@ -1329,6 +1329,334 @@ process.on('exit', function (code) {
   eq('the platform speech globals are gone after this section',
     typeof sandbox.speechSynthesis + '/' + typeof sandbox.SpeechSynthesisUtterance, 'undefined/undefined');
 
+  /* ================= v13 privacy: fetch, clear-all, notice ================= */
+
+  /* (1) WI1 — the one runtime fetch() states its no-credentials contract.
+     `T.fetchJson` IS the call site under test, driven here through a recorder
+     installed on the sandbox, so this is the real function and not a
+     re-implementation of it. */
+  const fetchCalls = [];
+  const REAL_FETCH = sandbox.fetch;
+  sandbox.fetch = function (url, opts) {
+    fetchCalls.push({ url: String(url), opts: opts });
+    return Promise.resolve({
+      ok: true, status: 200,
+      json: function () { return Promise.resolve({ ok: true }); }
+    });
+  };
+  const fetchRun = await settle(T.fetchJson('https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en', undefined));
+  /* The timeout race must be UNCHANGED by that options edit, so a fetch that
+     never settles still has to reject as TIMEOUT rather than hang the run. The
+     recorder is swapped for a never-settling stub, then the real one is put
+     back. */
+  sandbox.fetch = function () { return new Promise(function () {}); };
+  const hangRun = await settle(T.fetchJson('https://translate.googleapis.com/translate_a/single?client=gtx', undefined));
+  sandbox.fetch = REAL_FETCH;
+
+  ok('WI1: fetchJson resolves against the recording fetch stub', fetchRun.error === undefined,
+    fetchRun.error ? String((fetchRun.error && fetchRun.error.message) || fetchRun.error) : 'resolved');
+  eq('WI1: the translate fetch was called exactly once', fetchCalls.length, 1);
+  const fetchOpts = (fetchCalls[0] || {}).opts;
+  ok("WI1: the fetch was handed a real options object", !!fetchOpts && typeof fetchOpts === 'object',
+    'got ' + JSON.stringify(fetchOpts));
+  eq("WI1: the translate fetch sends no cookies (credentials: 'omit')",
+    fetchOpts && fetchOpts.credentials, 'omit');
+  eq("WI1: the translate fetch sends no Referer (referrerPolicy: 'no-referrer')",
+    fetchOpts && fetchOpts.referrerPolicy, 'no-referrer');
+  ok('WI1: the abort signal is still passed to fetch, so cancellation is unchanged',
+    !!fetchOpts && Object.prototype.hasOwnProperty.call(fetchOpts, 'signal'),
+    'the options object has no signal key: ' + JSON.stringify(fetchOpts));
+  eq('WI1: fetchJson still returns the parsed body, unchanged', fetchRun.value, { ok: true });
+  ok('WI1: a fetch that never settles still rejects as a TIMEOUT (the race survived)',
+    !!hangRun.error && hangRun.error.kind === 'TIMEOUT',
+    'expected a TIMEOUT rejection, got ' + (hangRun.error ? String(hangRun.error.kind) : String(hangRun.value)));
+  ok('WI1: the harness recording fetch is restored, so the run still refuses the network',
+    sandbox.fetch === REAL_FETCH);
+
+  /* (2) WI2 — "Clear all local data" really erases all three keys.
+     The stub is backed by a REAL store object whose removeItem deletes, so
+     "absent from storage" means absent and not "we forgot to look". */
+  const store = {
+    'tweb.cache.v1': JSON.stringify({
+      'en_US hello': { v: 'bonjour', t: 1 },
+      'en_US hi': { v: 'salut', t: 2 }
+    }),
+    'tweb.history.v1': JSON.stringify([
+      { text: 'hello', voice: 'Google en', wpm: 200, lang: 'en', t: 3 },
+      { text: 'hi', voice: 'Google en', wpm: 200, lang: 'en', t: 4 }
+    ]),
+    'tweb.settings.v1': JSON.stringify({ engine: 'google', target: 'fr_FR', speed: 200, voice: '' }),
+    'someone-elses.key': 'NOT OURS'
+  };
+  function storeGet(k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; }
+  const lsStore = {
+    getItem: function (k) { return storeGet(k); },
+    setItem: function (k, v) { store[k] = String(v); },
+    removeItem: function (k) { delete store[k]; }
+  };
+  /* Force the in-memory cacheDisabled flag through the REAL mechanism rather
+     than by poking a module global: a storage that refuses every write makes
+     cacheSet exhaust both of its attempts and disable caching for the session. */
+  const fullStorage = {
+    getItem: function (k) { return storeGet(k); },
+    setItem: function () { throw new Error('QuotaExceededError'); },
+    removeItem: function (k) { delete store[k]; }
+  };
+  sandbox.localStorage = fullStorage;
+  eq('WI2: the seeded cache really holds two entries before anything runs', T.cacheSize(), 2);
+  eq('WI2: a write into a storage that refuses everything reports failure',
+    T.cacheSet('will not fit', 'en_US', 'nope'), false);
+  eq('WI2: and the cache is now disabled for the session (size reads 0)',
+    T.cacheSize(), 0);
+  ok('WI2: the guard above is not vacuous — the cache map really is still non-empty',
+    Object.keys(JSON.parse(storeGet('tweb.cache.v1'))).length === 2,
+    'the on-disk cache is empty, so size 0 would prove nothing');
+  eq('WI2: a further write is refused outright while the cache is disabled',
+    T.cacheSet('still will not fit', 'en_US', 'nope'), false);
+  sandbox.localStorage = lsStore;
+
+  /* The overlay for the two re-renders. `historyList` needs the real child
+     protocol renderHistory drives: firstChild, appendChild, removeChild. */
+  function childList() {
+    return {
+      childNodes: [],
+      get firstChild() { return this.childNodes.length ? this.childNodes[0] : null; },
+      appendChild: function (n) { this.childNodes.push(n); return n; },
+      removeChild: function (n) { const at = this.childNodes.indexOf(n); if (at >= 0) this.childNodes.splice(at, 1); return n; }
+    };
+  }
+  const dataNodes = {
+    status: { textContent: '', attrs: {}, setAttribute: function (k, v) { this.attrs[k] = String(v); } },
+    cacheCount: { textContent: '' },
+    historyCount: { textContent: '' },
+    historyList: childList()
+  };
+  const REAL_GEBID = documentStub.getElementById;
+  const REAL_CREATE = documentStub.createElement;
+  documentStub.getElementById = function (id) {
+    domCalls.getElementById += 1;
+    return Object.prototype.hasOwnProperty.call(dataNodes, id) ? dataNodes[id] : null;
+  };
+  documentStub.createElement = function () {
+    domCalls.createElement += 1;
+    /* A real child protocol, not just a bare object: renderHistory appends two
+       children to each row it builds, so a stub without appendChild would turn
+       "the history was not cleared" into "the stub was incomplete" — a
+       failure for the wrong reason. */
+    return {
+      className: '', textContent: '', attrs: {},
+      childNodes: [],
+      setAttribute: function (k, v) { this.attrs[k] = String(v); },
+      get firstChild() { return this.childNodes.length ? this.childNodes[0] : null; },
+      appendChild: function (n) { this.childNodes.push(n); return n; },
+      removeChild: function (n) { const at = this.childNodes.indexOf(n); if (at >= 0) this.childNodes.splice(at, 1); return n; }
+    };
+  };
+
+  const genBeforeClear = T.getOpGen();
+  let clearThrew = null;
+  try { T.onClearAllData(); } catch (e) { clearThrew = e; }
+  const genAfterClear = T.getOpGen();
+
+  ok('WI2: "Clear all local data" does not throw', clearThrew === null,
+    clearThrew ? String((clearThrew && clearThrew.message) || clearThrew) : 'returned');
+  ok('WI2: it supersedes any in-flight operation by advancing the generation',
+    genAfterClear > genBeforeClear, genBeforeClear + ' -> ' + genAfterClear);
+  /* Absent, not emptied. `Object.keys` is the whole store: it proves all three
+     of this page's keys are gone AND that the foreign key survived, which is
+     what separates three removeItem calls from a blanket localStorage.clear(). */
+  eq("WI2: every key this page wrote is gone, and the foreign key survived",
+    Object.keys(store), ['someone-elses.key']);
+  eq('WI2: the history key is absent, not written back as an empty array',
+    store['tweb.history.v1'], undefined);
+  eq('WI2: the cache counter was re-rendered to zero', dataNodes.cacheCount.textContent, 'cache: 0 entries');
+  eq('WI2: the history count label was re-rendered to zero', dataNodes.historyCount.textContent, '0');
+  eq('WI2: the history list was emptied on the page as well as in storage',
+    dataNodes.historyList.childNodes.length, 0);
+  eq('WI2: the status line reports what was cleared',
+    dataNodes.status.textContent, 'Cleared cache, history and settings');
+  eq('WI2: and it reports success', dataNodes.status.attrs['data-kind'], 'ok');
+  /* cacheDisabled recovered: proof is a write that now SUCCEEDS and is counted.
+     cacheSize() alone could not tell a disabled cache from an empty one. */
+  eq('WI2: caching works again after the clear (the session-wide disable was lifted)',
+    T.cacheSet('after the clear', 'en_US', 'written again'), true);
+  eq('WI2: and that write is really counted, proving the cache is live again',
+    T.cacheSize(), 1);
+
+  /* The notice tells the reader the cache is "filed under the target language
+     and the text you typed". That is a claim about cacheKey(), so it is pinned
+     here against the storage, which is the only place the key is visible. A key
+     of the text alone would make one source text collide across every target
+     language and the second write would overwrite the first. */
+  const keyStore = {};
+  sandbox.localStorage = {
+    getItem: function (k) { return Object.prototype.hasOwnProperty.call(keyStore, k) ? keyStore[k] : null; },
+    setItem: function (k, v) { keyStore[k] = String(v); },
+    removeItem: function (k) { delete keyStore[k]; }
+  };
+  eq('WI2: a cache write into a working storage succeeds', T.cacheSet('hello', 'fr_FR', 'bonjour'), true);
+  eq('a second write of the SAME text to a DIFFERENT target also succeeds',
+    T.cacheSet('hello', 'de_DE', 'hallo'), true);
+  const cacheKeys = Object.keys(JSON.parse(keyStore['tweb.cache.v1']));
+  eq('the two target languages produced two distinct cache entries', cacheKeys.length, 2);
+  ok('every cache key names the target language it was filed under',
+    cacheKeys.every(function (k) { return k.indexOf('fr_FR') >= 0 || k.indexOf('de_DE') >= 0; }),
+    JSON.stringify(cacheKeys));
+  ok('and every cache key carries the text that was translated',
+    cacheKeys.every(function (k) { return k.indexOf('hello') >= 0; }), JSON.stringify(cacheKeys));
+
+  /* DEFECT 3: a removal the browser REFUSES must not be reported as a success.
+     removeKey() returns false when removeItem() throws — storage being
+     unavailable or refusing is a real outcome, not a theoretical one — and the
+     handler used to discard every return value, so it said "Cleared" over keys
+     that were still there. */
+  const stubborn = {
+    'tweb.cache.v1': JSON.stringify({ 'fr_FR hello': { v: 'bonjour', t: 1 } }),
+    'tweb.history.v1': JSON.stringify([{ text: 'hello', voice: 'Google fr', wpm: 200, lang: 'fr', t: 2 }]),
+    'tweb.settings.v1': JSON.stringify({ engine: 'google', target: 'fr_FR', speed: 200, voice: '' })
+  };
+  sandbox.localStorage = {
+    getItem: function (k) { return Object.prototype.hasOwnProperty.call(stubborn, k) ? stubborn[k] : null; },
+    setItem: function (k, v) { stubborn[k] = String(v); },
+    removeItem: function (k) {
+      if (k === 'tweb.history.v1') throw new Error('the browser refused the deletion');
+      delete stubborn[k];
+    }
+  };
+  dataNodes.status.textContent = '';
+  dataNodes.status.attrs = {};
+  let refuseThrew = null;
+  try { T.onClearAllData(); } catch (e) { refuseThrew = e; }
+
+  ok('WI2: a refused deletion does not throw out of the handler', refuseThrew === null,
+    refuseThrew ? String((refuseThrew && refuseThrew.message) || refuseThrew) : 'returned');
+  ok('WI2: it does NOT report the success message when a removal was refused',
+    dataNodes.status.textContent !== 'Cleared cache, history and settings',
+    'it reported the success message anyway: ' + JSON.stringify(dataNodes.status.textContent));
+  eq('WI2: the status kind is err on the refused path', dataNodes.status.attrs['data-kind'], 'err');
+  ok('WI2: the message says the browser refused and the data may remain',
+    /refused/.test(dataNodes.status.textContent) && /still be present/.test(dataNodes.status.textContent),
+    'got ' + JSON.stringify(dataNodes.status.textContent));
+  /* Both re-renders must still run on the failure path — they are what shows
+     the user, truthfully, which entry survived. */
+  eq('WI2: the cache counter is still re-rendered on the refused path',
+    dataNodes.cacheCount.textContent, 'cache: 0 entries');
+  eq('WI2: the history count still shows the entry the browser refused to erase',
+    dataNodes.historyCount.textContent, '1');
+  ok('WI2: and that surviving entry is actually rendered, not silently dropped',
+    dataNodes.historyList.childNodes.length === 1,
+    'rendered ' + dataNodes.historyList.childNodes.length + ' rows');
+  eq('WI2: the key the browser refused really is still in storage',
+    Object.keys(stubborn), ['tweb.history.v1']);
+
+  documentStub.getElementById = REAL_GEBID;
+  documentStub.createElement = REAL_CREATE;
+  delete sandbox.localStorage;
+  eq('WI2: the document seam is restored after the clear-all fixture',
+    documentStub.getElementById('status'), null);
+
+  /* (3) WI3 — the privacy notice. Read as TEXT: the script block and all tags
+     stripped and the entities this file uses decoded, so a claim cannot be
+     satisfied by markup alone and a wording change is actually detected. */
+  const pageText = html
+    .replace(/<script>[\s\S]*?<\/script>/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&rsquo;|&lsquo;/g, "'")
+    .replace(/&ldquo;|&rdquo;/g, '"')
+    .replace(/&mdash;/g, '\u2014')
+    .replace(/&ndash;/g, '\u2013')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/\s+/g, ' ');
+  function says(claim, needle) {
+    ok('WI3: the notice states ' + claim, pageText.indexOf(needle) >= 0,
+      'not found in the page text: ' + JSON.stringify(needle));
+  }
+  function neverSays(claim, needle) {
+    ok('WI3: the notice does NOT say ' + claim, pageText.indexOf(needle) === -1,
+      'still present in the page: ' + JSON.stringify(needle));
+  }
+
+  /* SPEC CHANGE (v13 accuracy review). Five expectations below were corrected
+     because the NOTICE they pin was wrong, not because the code drifted:
+
+       1. "We cannot read what you type, BECAUSE THERE IS NOWHERE FOR IT TO GO"
+          contradicted the very next paragraph — the text does go somewhere, to
+          Google's translate service. The claim is now scoped to the owner:
+          nothing is sent to US, because we have no way to receive it. A
+          negated negative assertion below pins the removal of the false clause.
+       2. The cache key is the TARGET LANGUAGE TOGETHER WITH the text, not the
+          text alone; "where the key is the text you typed" was simply wrong.
+       3. The history records translations when speech is REQUESTED, before
+          playback is confirmed — rememberSpoken() runs ahead of speakGoogle() —
+          so "spoken translations" overclaimed. The entry may correspond to
+          audio that never played.
+       4. The translation reaches Google's TTS service only on the Google-voice
+          path; Browser local makes no TTS request at all. The unconditional
+          "Google necessarily receives both" was false for that engine.
+       5. The Browser-local paragraph now states the accurate consequence: the
+          text still goes to Google to be TRANSLATED, and what is avoided is
+          sending the translation to the TTS service. */
+  says('there is no server, no accounts, no analytics and no tracking',
+    'This page has no server, no accounts, no analytics and no tracking.');
+  says('that nothing typed is sent to us, because we have no way to receive it',
+    'Nothing you type is sent to us, because we have no way to receive it.');
+  says('the settings that are stored', 'your settings (voice engine, voice, speed and target language)');
+  says('the cache, capped at 300, filed under the target language and the text',
+    'a cache of up to 300 translations, filed under the target language and the text you typed');
+  says('the history, capped at 20, with voice, speed and language',
+    'a history of up to 20 translations, with the voice, speed and language used for each');
+  says('that "Clear all local data" erases all three', '"Clear all local data" erases all three');
+  says('that erasing does not claim to reset the controls on the page',
+    'Erasing it does not reset the controls on this page; they stay as they are until you change them or reload.');
+  says('that Google necessarily receives the text sent for translation',
+    'Your text is sent to Google\'s translate service to be translated, and Google necessarily receives it.');
+  says('that the TTS disclosure is conditional on the Google voice',
+    'With the Google voice, the resulting translation is also sent to Google\'s text-to-speech service to be spoken, so Google receives that too.');
+  says('that we receive none of any of it', 'We receive none of it.');
+  says('that GitHub serves the page', 'This page is served by GitHub');
+  says('that the cookie caveat applies when the Google voice is used',
+    'When the Google voice is used, the spoken audio is fetched directly by your browser\'s media element.');
+  says('the github.com cookie caveat on the media element',
+    'the cookies your browser holds for google.com');
+  says('that "Browser local" changes only the voice and still sends the text to Google',
+    '"Browser local" is not offline. It changes the voice only. Your text is still sent to Google to be translated.');
+  says('that what Browser local avoids is the text-to-speech request, not the translation',
+    'What it avoids is sending the translation to the text-to-speech service: that audio is generated on your device, using the voices already installed there.');
+  says('that the issue tracker is public', "This project's issue tracker is public.");
+  says('no third-party JavaScript', 'No third-party JavaScript, no build step, nothing to download.');
+
+  /* The false claims the old footer made. Any of these reappearing would tell
+     the reader something untrue about where their text goes. */
+  neverSays('that Browser local audio never leaves the page', 'audio never leaves');
+  neverSays('that the history has no button of its own', 'The history has no button of its own');
+  neverSays('that the audio is never spoken from a server you control',
+    'never spoken from a server you control');
+  /* The self-contradicting clause removed in the v13 accuracy review: the text
+     DOES go to Google, so it has somewhere to go. This is what fails if the
+     old sentence is restored while the corrected one is left in place too. */
+  neverSays('the contradicting "nowhere for it to go" clause', 'nowhere for it to go');
+  neverSays('the superseded unconditional "we receive neither"', 'We receive neither');
+  neverSays('a cache key described as the text alone', 'where the key is the text you typed');
+  neverSays('a history claimed to be confirmed-played', 'spoken translations');
+
+  const footerStart = html.indexOf('<footer>');
+  const footerEnd = html.indexOf('</footer>');
+  const noticeAt = html.indexOf('no server, no accounts, no analytics');
+  ok('WI3: the notice sits inside the <footer> element, at the bottom of the page',
+    footerStart >= 0 && footerEnd > footerStart && noticeAt > footerStart && noticeAt < footerEnd,
+    'footer at ' + footerStart + ', notice at ' + noticeAt + ', /footer at ' + footerEnd);
+  const clearAllLabel = (html.match(/id="btnClearAllData"[^>]*>([^<]*)</) || [])[1];
+  eq('WI3: the button the notice names is the button the page actually has',
+    String(clearAllLabel).trim(), 'Clear all local data');
+
+  /* (4) WI4 — no Content-Security-Policy. Deliberately dropped: it could not
+     be verified without a browser and risked breaking a working page. This
+     check exists only so it cannot reappear unnoticed. */
+  ok('WI4: no Content-Security-Policy meta was added to the page',
+    !/<meta[^>]*http-equiv\s*=\s*["']?Content-Security-Policy/i.test(html),
+    'a Content-Security-Policy meta is present in the served markup');
+
   section('the media element must NOT send a Referer to the TTS endpoint');
 
   /* The real bug: Google serves a 404 text/html page to a translate_tts
