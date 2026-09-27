@@ -62,6 +62,12 @@ summary{cursor:pointer;font-size:13px}
 .hmeta{color:var(--muted);font-size:11px;display:block}
 footer{color:var(--muted);font-size:12px;line-height:1.5;padding:4px 2px 24px}
 footer p{margin:.35em 0}
+/* Privacy disclosure: scoped typography only — uppercase 12px heading, 8px body,
+   controlled measure, natural wrapping, subtle separators between topics. */
+.privacy-disclosure{max-width:65ch}
+.privacy-disclosure p{margin:0;font-size:8px;line-height:1.55;overflow-wrap:break-word}
+.privacy-disclosure .privacy-title{font-size:12px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:.6em}
+.privacy-disclosure p+p{border-top:1px solid var(--line);padding-top:.7em;margin-top:.7em}
 .visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 @media (max-width:640px){
   .row>*[data-grow]{flex:1 1 100%}
@@ -131,32 +137,34 @@ footer p{margin:.35em 0}
   </section>
 
   <footer>
-    <p><strong>Privacy</strong></p>
-    <p><strong>We don&rsquo;t keep your data.</strong> This page has no server, no accounts, no analytics and no
-      tracking. Nothing you type is sent to us, because we have no way to receive it.</p>
-    <p><strong>What gets saved stays in your browser.</strong> Three things are stored locally, in this browser, on
-      this device: your settings (voice engine, voice, speed and target language); a cache of up to 300
-      translations, filed under the target language and the text you typed; and a history of up to 20 translations,
-      with the voice, speed and language used for each. &ldquo;Clear all local data&rdquo; erases all three. This
-      data belongs to this web address in this browser &mdash; it does not follow you to another device or another
-      browser, and clearing this site&rsquo;s data in your browser removes it. Erasing it does not reset the controls
-      on this page; they stay as they are until you change them or reload.</p>
-    <p><strong>What leaves your device, and who receives it.</strong> Your text is sent to Google&rsquo;s translate
-      service to be translated, and Google necessarily receives it. With the Google voice, the resulting translation
-      is also sent to Google&rsquo;s text-to-speech service to be spoken, so Google receives that too. We receive
-      none of it. This page is served by GitHub, which &mdash; like any web host &mdash; sees your IP address, your
-      browser and the time of the request, but not the text you type.</p>
-    <p><strong>The one thing we can&rsquo;t control.</strong> When the Google voice is used, the spoken audio is
-      fetched directly by your browser&rsquo;s media element. That request may include the cookies your browser holds
-      for google.com, so if you are signed in to Google the request can be linked to that account. Google also sets a
-      cookie of its own in reply. This page has no way to prevent either. If that matters to you, use a private or
-      incognito window, sign out of Google, or choose the &ldquo;Browser local&rdquo; engine.</p>
-    <p><strong>&ldquo;Browser local&rdquo; is not offline.</strong> It changes the voice only. Your text is still sent
-      to Google to be translated. What it avoids is sending the translation to the text-to-speech service: that audio
-      is generated on your device, using the voices already installed there.</p>
-    <p><strong>One practical note.</strong> This project&rsquo;s issue tracker is public. Please do not paste
-      sensitive text into it.</p>
-    <p>No third-party JavaScript, no build step, nothing to download.</p>
+    <section class="privacy-disclosure">
+      <p class="privacy-title"><strong>Privacy</strong></p>
+      <p><strong>We don&rsquo;t keep your data.</strong> This page has no server, no accounts, no analytics and no
+        tracking. Nothing you type is sent to us, because we have no way to receive it.</p>
+      <p><strong>What gets saved stays in your browser.</strong> Three things are stored locally, in this browser, on
+        this device: your settings (voice engine, voice, speed and target language); a cache of up to 300
+        translations, filed under the target language and the text you typed; and a history of up to 20 translations,
+        with the voice, speed and language used for each. &ldquo;Clear all local data&rdquo; erases all three. This
+        data belongs to this web address in this browser &mdash; it does not follow you to another device or another
+        browser, and clearing this site&rsquo;s data in your browser removes it. Erasing it does not reset the controls
+        on this page; they stay as they are until you change them or reload.</p>
+      <p><strong>What leaves your device, and who receives it.</strong> Your text is sent to Google&rsquo;s translate
+        service to be translated, and Google necessarily receives it. With the Google voice, the resulting translation
+        is also sent to Google&rsquo;s text-to-speech service to be spoken, so Google receives that too. We receive
+        none of it. This page is served by GitHub, which &mdash; like any web host &mdash; sees your IP address, your
+        browser and the time of the request, but not the text you type.</p>
+      <p><strong>The one thing we can&rsquo;t control.</strong> When the Google voice is used, the spoken audio is
+        fetched directly by your browser&rsquo;s media element. That request may include the cookies your browser holds
+        for google.com, so if you are signed in to Google the request can be linked to that account. Google also sets a
+        cookie of its own in reply. This page has no way to prevent either. If that matters to you, use a private or
+        incognito window, sign out of Google, or choose the &ldquo;Browser local&rdquo; engine.</p>
+      <p><strong>&ldquo;Browser local&rdquo; is not offline.</strong> It changes the voice only. Your text is still sent
+        to Google to be translated. What it avoids is sending the translation to the text-to-speech service: that audio
+        is generated on your device, using the voices already installed there.</p>
+      <p><strong>One practical note.</strong> This project&rsquo;s issue tracker is public. Please do not paste
+        sensitive text into it.</p>
+      <p>No third-party JavaScript, no build step, nothing to download.</p>
+    </section>
   </footer>
 
 </div>
