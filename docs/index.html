@@ -119,6 +119,7 @@ footer p{margin:.35em 0}
       <button id="btnCopy" type="button">Copy</button>
       <span class="chip" id="cacheCount">cache: 0 entries</span>
       <button id="btnClearCache" type="button">Clear cache</button>
+      <button id="btnClearAllData" type="button">Clear all local data</button>
     </div>
   </section>
 
@@ -130,18 +131,32 @@ footer p{margin:.35em 0}
   </section>
 
   <footer>
-    <p><strong>Privacy.</strong> Both halves of this page are Google&rsquo;s, and both are online by default. The text you
-      type is sent to Google&rsquo;s translate endpoint, and the resulting translation is sent to Google&rsquo;s
-      text-to-speech endpoint and played immediately &mdash; it is never spoken from a server you control, because there
-      is no server. The only exception is the &ldquo;Browser local&rdquo; voice engine, which you have to choose on purpose:
-      it uses the voices already installed on this device and that audio never leaves the page.</p>
-    <p>Your settings, the translation cache (last 300 translations) and your last 20 history entries are kept in
-      this browser&rsquo;s localStorage, for this site&rsquo;s origin, on this device. The cache can be erased with the
-      &ldquo;Clear cache&rdquo; button. The history has no button of its own: it is removed when you clear this
-      site&rsquo;s data in your browser. Nothing here can promise that localStorage entries survive &mdash; clearing
-      site data, a private window or a browser reset all delete them. Nothing is sent to any server you control,
-      because there is no server.</p>
-    <p>No offline engine, no download, no build step, no third-party JavaScript.</p>
+    <p><strong>Privacy</strong></p>
+    <p><strong>We don&rsquo;t keep your data.</strong> This page has no server, no accounts, no analytics and no
+      tracking. Nothing you type is sent to us, because we have no way to receive it.</p>
+    <p><strong>What gets saved stays in your browser.</strong> Three things are stored locally, in this browser, on
+      this device: your settings (voice engine, voice, speed and target language); a cache of up to 300
+      translations, filed under the target language and the text you typed; and a history of up to 20 translations,
+      with the voice, speed and language used for each. &ldquo;Clear all local data&rdquo; erases all three. This
+      data belongs to this web address in this browser &mdash; it does not follow you to another device or another
+      browser, and clearing this site&rsquo;s data in your browser removes it. Erasing it does not reset the controls
+      on this page; they stay as they are until you change them or reload.</p>
+    <p><strong>What leaves your device, and who receives it.</strong> Your text is sent to Google&rsquo;s translate
+      service to be translated, and Google necessarily receives it. With the Google voice, the resulting translation
+      is also sent to Google&rsquo;s text-to-speech service to be spoken, so Google receives that too. We receive
+      none of it. This page is served by GitHub, which &mdash; like any web host &mdash; sees your IP address, your
+      browser and the time of the request, but not the text you type.</p>
+    <p><strong>The one thing we can&rsquo;t control.</strong> When the Google voice is used, the spoken audio is
+      fetched directly by your browser&rsquo;s media element. That request may include the cookies your browser holds
+      for google.com, so if you are signed in to Google the request can be linked to that account. Google also sets a
+      cookie of its own in reply. This page has no way to prevent either. If that matters to you, use a private or
+      incognito window, sign out of Google, or choose the &ldquo;Browser local&rdquo; engine.</p>
+    <p><strong>&ldquo;Browser local&rdquo; is not offline.</strong> It changes the voice only. Your text is still sent
+      to Google to be translated. What it avoids is sending the translation to the text-to-speech service: that audio
+      is generated on your device, using the voices already installed there.</p>
+    <p><strong>One practical note.</strong> This project&rsquo;s issue tracker is public. Please do not paste
+      sensitive text into it.</p>
+    <p>No third-party JavaScript, no build step, nothing to download.</p>
   </footer>
 
 </div>
@@ -582,7 +597,20 @@ function beginUserOperation() {
    DOES advance the failover, because a slow endpoint is a failed endpoint. */
 async function fetchJson(url, signal) {
   const attempt = (async function () {
-    const res = await fetch(url, { signal: signal });
+    const res = await fetch(url, {
+      signal: signal,
+      /* EXPLICIT no-credentials and no-referrer on the one and only runtime
+         fetch() in this page. fetch() already omits cookies for a cross-origin
+         URL — credentials defaults to 'same-origin' and both Google endpoints
+         are cross-origin — so nothing is sent today. But a DEFAULT is not a
+         GUARANTEE: it holds only while this call site stays exactly as it is,
+         and the next edit to these options could widen it silently. Stating
+         both makes the guarantee survive that edit.
+         Nothing about the timeout, the failover, the retry or the cancellation
+         below is changed: this is the same single attempt, raced the same way. */
+      credentials: 'omit',
+      referrerPolicy: 'no-referrer'
+    });
     if (res.ok === false) throw taggedError('HTTP ' + res.status);
     return await res.json();
   })();
@@ -856,6 +884,18 @@ function lsSet(key, value) {
     return true;
   } catch (e) { return false; }
 }
+/* Every erasure in this page goes through here, so "the key is gone" means the
+   SAME thing everywhere: removeItem, never a write of an empty value. A key set
+   to '[]' or '{}' is still PRESENT, still occupies the origin's storage, and
+   still shows up in a site's storage inspector — which is not what a user who
+   pressed an erase button was promised. */
+function removeKey(key) {
+  try {
+    if (typeof localStorage === 'undefined' || !localStorage) return false;
+    localStorage.removeItem(key);
+    return true;
+  } catch (e) { return false; }
+}
 function cacheMap() {
   const m = lsGet(CACHE_KEY);
   if (!m || typeof m !== 'object' || Array.isArray(m)) return {};
@@ -894,7 +934,7 @@ function cacheSet(text, target, value) {
 }
 function cacheClear() {
   cacheDisabled = false;
-  try { if (typeof localStorage !== 'undefined' && localStorage) localStorage.removeItem(CACHE_KEY); } catch (e) { /* ignore */ }
+  removeKey(CACHE_KEY);
 }
 function cacheSize() {
   if (cacheDisabled) return 0;
@@ -943,7 +983,66 @@ function addHistory(entry) {
   list.unshift({ text: entry.text, voice: entry.voice, wpm: entry.wpm, lang: entry.lang, t: Date.now() });
   lsSet(HISTORY_KEY, list.slice(0, HISTORY_MAX_ENTRIES));
 }
-function clearHistory() { lsSet(HISTORY_KEY, []); }
+/* The key is REMOVED, not emptied. Writing [] would leave tweb.history.v1 in
+   storage, so "the history has been erased" would be a claim the storage
+   inspector could disprove at a glance. */
+function clearHistory() { return removeKey(HISTORY_KEY); }
+
+/* "Clear all local data": erase EVERY key this page has ever written, and
+   nothing else. These three are the complete set — the cache, the settings and
+   the history — and the privacy notice in the footer states exactly these
+   three, so the notice and this function must not drift apart.
+
+   The in-flight operation is superseded FIRST, through the same
+   beginUserOperation() every user action uses. A translation that is mid-flight
+   will, on completion, call cacheSet() and addHistory(); both of those would
+   otherwise write tweb.cache.v1 and tweb.history.v1 straight back AFTER this
+   erase, and the user would be left believing their data was gone when it was
+   not. Bumping the generation makes the in-flight run stale, so it returns at
+   its next isCurrent() check without writing anything.
+
+   cacheDisabled is reset as well: it is set true when a quota error
+   permanently disables caching, and without this the page would stay
+   permanently uncached for the rest of the session after the user freed the
+   very space the quota error was about. */
+function clearAllLocalData() {
+  beginUserOperation();
+  cacheDisabled = false;
+  /* Every removal's RESULT is collected. removeKey() reports false when
+     storage is unavailable (private mode, disabled cookies) or when
+     removeItem() itself throws — a real outcome, not a theoretical one — and
+     discarding those returns is what let the handler claim a clean erase it
+     could not perform. All three are attempted even after one fails: a partial
+     erase is still better than none, and the return says how complete it was. */
+  let complete = true;
+  if (!removeKey(CACHE_KEY)) complete = false;
+  if (!removeKey(HISTORY_KEY)) complete = false;
+  if (!removeKey(SETTINGS_KEY)) complete = false;
+  return complete;
+}
+
+/* The button handler, separated from init() so the whole behaviour — the
+   supersede, the three erasures, both re-renders and the status line — is
+   assertable offline, exactly as onStop and onTranslate are. */
+function onClearAllData() {
+  const complete = clearAllLocalData();
+  /* BOTH re-renders run either way. On the failure path they are the only
+     thing that tells the user the truth: an entry the browser refused to erase
+     stays on screen instead of vanishing. */
+  renderCacheCount();
+  renderHistory();
+  if (complete) {
+    /* Honest scope: this erases what is STORED. The translated text still in
+       the output box and the current control values are the page's live state,
+       not storage, and the message does not claim to have cleared them. */
+    setStatus('Cleared cache, history and settings', 'ok');
+    return;
+  }
+  /* Do not claim an erase that did not happen. Saying "cleared" over a key the
+     browser kept would be exactly the kind of inaccuracy the privacy notice
+     exists to avoid, and the user would have no reason to try again. */
+  setStatus('The browser refused the deletion, so some of this data may still be present', 'err');
+}
 
 /* ------------------------------ DOM writes ------------------------------ */
 
@@ -1340,6 +1439,7 @@ function init() {
   if (el('btnClearCache')) el('btnClearCache').addEventListener('click', function () {
     cacheClear(); renderCacheCount(); setStatus('Cache cleared', 'ok');
   });
+  if (el('btnClearAllData')) el('btnClearAllData').addEventListener('click', onClearAllData);
   if (el('btnCopy')) el('btnCopy').addEventListener('click', function () {
     const value = el('output') ? el('output').value : '';
     if (!value) { setStatus('Nothing to copy', 'err'); return; }
@@ -1395,6 +1495,11 @@ if (typeof module !== 'undefined' && module && module.exports) {
     onTranslate: onTranslate,
     runSpeech: runSpeech,
     onStop: onStop,
+    onClearAllData: onClearAllData,
+    clearAllLocalData: clearAllLocalData,
+    clearHistory: clearHistory,
+    cacheSet: cacheSet,
+    cacheSize: cacheSize,
     PROVIDERS: PROVIDERS,
     clamp: clamp,
     sanitizeText: sanitizeText,
